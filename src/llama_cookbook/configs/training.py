@@ -60,4 +60,11 @@ class train_config:
     weighting_alpha: float = 1.0
 
     training_regression: bool = False # if training_regression = True, regressor head training.
-    use_negative_essay: bool = False
+    training_regressor_head: bool = False # if trianing_regression = True and this is False, only LoRA training.
+    regressor_module_path: str = None # pre-trained regressor module path
+    regressor_p_dropout: float = 0.2
+    regressor_layer_type: str = "mlp"
+    regressor_layer_depth: int = 2
+    use_negative_essay: bool = True
+    add_stimulus: bool = True
+    use_eos: bool = False

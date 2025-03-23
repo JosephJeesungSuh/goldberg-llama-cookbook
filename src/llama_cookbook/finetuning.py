@@ -234,11 +234,15 @@ def main(**kwargs):
             f"Model type {config.model_type} is not supported. Please use llama or mllama model."
         )
     # Load the tokenizer and add special tokens
-    tokenizer = AutoTokenizer.from_pretrained(
-        train_config.model_name
-        if train_config.tokenizer_name is None
-        else train_config.tokenizer_name
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            train_config.model_name if train_config.tokenizer_name is None else train_config.tokenizer_name,
+            add_prefix_space=False,
+        )
+    except:
+        tokenizer = AutoTokenizer.from_pretrained(
+            train_config.model_name if train_config.tokenizer_name is None else train_config.tokenizer_name,
+        )
     if not tokenizer.pad_token_id:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -326,7 +330,19 @@ def main(**kwargs):
 
         regressor_module = None
         if train_config.training_regression:
-            regressor_module = MultiValueClassifier(hidden_dim = model.lm_head.in_features)
+            regressor_module = MultiValueClassifier(
+                hidden_dim = model.lm_head.in_features,
+                # num_values = 5 if train_config.trait == "all" else 1,
+                num_values = 1,
+                # num_classes = 1,
+                num_classes = 5,
+                layer_type = train_config.regressor_layer_type,
+                depth = train_config.regressor_layer_depth,
+                p_dropout = train_config.regressor_p_dropout,
+                dtype = torch.bfloat16
+            )
+            if train_config.regressor_module_path is not None:
+                regressor_module.load_state_dict(torch.load(train_config.regressor_module_path))
             regressor_module = regressor_module.to(local_rank)
 
         if train_config.freeze_LLM_only:
@@ -380,9 +396,7 @@ def main(**kwargs):
         dataset_processer,
         dataset_config,
         split="train",
-        trait=train_config.trait,
-        tone=train_config.tone,
-        use_negative_essay=train_config.use_negative_essay,
+        train_config=train_config,
     )
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
@@ -391,9 +405,7 @@ def main(**kwargs):
         dataset_processer,
         dataset_config,
         split="test",
-        trait=train_config.trait,
-        tone=train_config.tone,
-        use_negative_essay=train_config.use_negative_essay,
+        train_config=train_config,
     )
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Validation Set Length = {len(dataset_val)}")
@@ -456,7 +468,11 @@ def main(**kwargs):
     # Initialize the optimizer and learning rate scheduler
     if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
         optimizer = AnyPrecisionAdamW(
-            list(model.parameters()) + list(regressor_module.parameters()) if train_config.training_regression else [],
+            list(model.parameters()) + (
+                list(regressor_module.parameters())
+                if train_config.training_regression and train_config.training_regressor_head
+                else []
+            ),
             lr=train_config.lr,
             momentum_dtype=torch.bfloat16,
             variance_dtype=torch.bfloat16,
@@ -465,7 +481,11 @@ def main(**kwargs):
         )
     else:
         optimizer = optim.AdamW(
-            list(model.parameters()) + (list(regressor_module.parameters()) if train_config.training_regression else []),
+            list(model.parameters()) + (
+                list(regressor_module.parameters())
+                if train_config.training_regression and train_config.training_regressor_head
+                else []
+            ),
             lr=train_config.lr,
             weight_decay=train_config.weight_decay,
         )

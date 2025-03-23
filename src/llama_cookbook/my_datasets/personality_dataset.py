@@ -10,15 +10,23 @@ import datasets
 import pandas as pd
 import numpy as np
 
-def get_preprocessed_personality_dataset(dataset_config, tokenizer, split, trait, tone, use_negative_essay):
+def get_preprocessed_personality_dataset(dataset_config, tokenizer, split, train_config):
 
-    if trait not in ['SURGENCY', 'EMOTIONAL_STABILITY', 'AGREEABLENESS', 'INTELLECT', 'CONSCIENTIOUSNESS']:
-        raise ValueError(f"--> get_preprocessed_personality_dataset: Invalid trait {trait}")
-    if tone not in ['positive', 'negative','all']:
-        raise ValueError(f"--> get_preprocessed_personality_dataset: Invalid tone {tone}")
+    trait = train_config.trait
+    tone = train_config.tone
+    use_negative_essay = train_config.use_negative_essay
+    training_regression = train_config.training_regression
+    add_stimulus = train_config.add_stimulus
+    
     pre_essay_question = dataset_config.pre_essay_question
     pre_negative_essay_question = dataset_config.pre_negative_essay_question
     essay_frame = dataset_config.essay_frame
+    stimulus = dataset_config.stimulus
+
+    if trait not in ['SURGENCY', 'EMOTIONAL_STABILITY', 'AGREEABLENESS', 'INTELLECT', 'CONSCIENTIOUSNESS', 'all']:
+        raise ValueError(f"--> get_preprocessed_personality_dataset: Invalid trait {trait}")
+    if tone not in ['positive', 'negative','all']:
+        raise ValueError(f"--> get_preprocessed_personality_dataset: Invalid tone {tone}")
 
     model_name = tokenizer.name_or_path.split("/")[-1]
     preprocessed_file_dir = split.split(".")[0] + f"_model_{model_name}_{trait}_{tone}_preprocessed.json"
@@ -31,10 +39,11 @@ def get_preprocessed_personality_dataset(dataset_config, tokenizer, split, trait
     
     with open(split, 'r') as f:
         dataset = datasets.load_dataset('json', data_files=split, split='train')
-    trait_median_value = np.median([x[trait] for x in dataset])
     if tone == 'positive':
+        trait_median_value = np.median([x[trait] for x in dataset])
         dataset = dataset.filter(lambda x: x[trait] >= trait_median_value)
     elif tone == 'negative':
+        trait_median_value = np.median([x[trait] for x in dataset])
         dataset = dataset.filter(lambda x: x[trait] < trait_median_value)
     elif tone == 'all':
         dataset = dataset
@@ -42,88 +51,84 @@ def get_preprocessed_personality_dataset(dataset_config, tokenizer, split, trait
 
 
     def tokenize_add_label(sample):
-        # prefix_essay = tokenizer.encode(
-        #     tokenizer.bos_token + pre_essay_question.strip() + "\n\n" + essay_frame.strip(),
-        #     add_special_tokens=False
-        # )
-        # essay = tokenizer.encode(
-        #     (
-        #         sample["text"].strip() # whitespace automatically added at the beginning
-        #         + tokenizer.eos_token if not use_negative_essay else "\n\n"
-        #     ),
-        #     add_special_tokens=False
-        # )
+        
         if use_negative_essay:
             prefix_1 = (
-                tokenizer.bos_token
+                tokenizer.bos_token + " "
                 + pre_essay_question.strip()
                 + "\n\n"
                 + essay_frame.strip()
             )
+            essay_1 = " " + sample["text"].strip() + "\n\n"
             prefix_2 = (
                 pre_negative_essay_question.strip()
                 + "\n\n"
                 + essay_frame.strip()
             )
+            essay_2 = " " + sample["negative_text"].strip()
             input_ids = tokenizer.encode(
-                prefix_1
-                + " " + sample["text"].strip() + "\n\n"
-                + prefix_2
-                + " " + sample["negative_text"].strip() + tokenizer.eos_token,
+                prefix_1 + essay_1 + prefix_2 + essay_2
+                + (stimulus if add_stimulus else "") + tokenizer.eos_token,
                 add_special_tokens=False
             )
-            len_prefix_1 = len(
-                tokenizer.encode(prefix_1, add_special_tokens=False)
+            len_prefix_1 = len(tokenizer.encode(prefix_1, add_special_tokens=False))
+            len_essay = len(tokenizer.encode(essay_1, add_special_tokens=False))
+            len_prefix_2 = len(tokenizer.encode(prefix_2, add_special_tokens=False))
+            len_negative_essay = len(tokenizer.encode(essay_2, add_special_tokens=False))
+            assert len(input_ids) == (
+                len_prefix_1 + len_essay + len_prefix_2 + len_negative_essay
+                + (len(tokenizer.encode(stimulus, add_special_tokens=False)) if add_stimulus else 0) + 1
             )
-            len_essay = len(
-                tokenizer.encode(sample["text"].strip() + "\n\n", add_special_tokens=False)
-            )
-            len_prefix_2 = len(
-                tokenizer.encode(prefix_2, add_special_tokens=False)
-            )
-            len_negative_essay = len(
-                tokenizer.encode(sample["negative_text"].strip() + tokenizer.eos_token, add_special_tokens=False)
-            )
-            assert len(input_ids) == len_prefix_1 + len_essay + len_prefix_2 + len_negative_essay
 
         else:
             prefix = (
-                tokenizer.bos_token
+                tokenizer.bos_token + " "
                 + pre_essay_question.strip()
                 + "\n\n"
                 + essay_frame.strip()
             )
+            essay = " " + sample["text"].strip()
             input_ids = tokenizer.encode(
-                prefix + " " + sample["text"].strip() + tokenizer.eos_token,
+                prefix + essay
+                + (stimulus if add_stimulus else "") + tokenizer.eos_token,
                 add_special_tokens=False
             )
-            len_prefix = len(
-                tokenizer.encode(prefix, add_special_tokens=False)
+            len_prefix = len(tokenizer.encode(prefix, add_special_tokens=False))
+            len_essay = len(tokenizer.encode(essay, add_special_tokens=False))
+            assert len(input_ids) == (
+                len_prefix + len_essay
+                + (len(tokenizer.encode(stimulus, add_special_tokens=False)) if add_stimulus else 0) + 1
             )
-            len_essay = len(
-                tokenizer.encode(sample["text"].strip() + tokenizer.eos_token,
-                add_special_tokens=False)
-            )
-            assert len(input_ids) == len_prefix + len_essay
 
         sample_processed = {
-            "input_ids": input_ids, # prefix_essay + essay,
-            "attention_mask" : [1] * len(input_ids), # [1] * (len(prefix_essay) + len(essay)),
+            "input_ids": input_ids,
+            "attention_mask" : [1] * len(input_ids),
             "labels": (
-                [-100] * len_prefix + input_ids[len_prefix:] if not use_negative_essay
+                (
+                    [-100] * len_prefix
+                    + input_ids[len_prefix:len_prefix + len_essay]
+                    + [-100] * (len(input_ids) - len_prefix - len_essay)
+                ) if not use_negative_essay
                 else (
                     [-100] * len_prefix_1
                     + input_ids[len_prefix_1: len_prefix_1 + len_essay]
                     + [-100] * len_prefix_2
-                    + input_ids[len_prefix_1 + len_essay + len_prefix_2:]
+                    + input_ids[len_prefix_1 + len_essay + len_prefix_2: len_prefix_1 + len_essay + len_prefix_2 + len_negative_essay]
+                    + [-100] * (len(input_ids) - len_prefix_1 - len_essay - len_prefix_2 - len_negative_essay)
                 )
-            ), # [-100] * len(prefix_essay) + essay,
-            "trait_value_from_median": abs(sample[trait] - trait_median_value),
-            "bfi_labels": sample['bfi_label'],
-            }
+            ),
+            "trait_value_from_median": (abs(sample[trait] - trait_median_value)) if (trait != 'all' and tone != 'all') else 0,
+            "bfi2_labels": sample['bfi_label'],
+            "bigfive_scores": [
+                sample['SURGENCY'],
+                sample['AGREEABLENESS'],
+                sample['CONSCIENTIOUSNESS'],
+                sample['EMOTIONAL_STABILITY'],
+                sample['INTELLECT'],
+            ]
+        }
 
         return sample_processed
-
 
     processed_dataset = dataset.map(tokenize_add_label, remove_columns=list(dataset.features))
     with open(preprocessed_file_dir, 'w') as f:
