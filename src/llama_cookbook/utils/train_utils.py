@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from datetime import datetime
 import contextlib
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Optional
 
 
 import torch
@@ -35,6 +35,28 @@ from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
+
+
+def log_gradient_norms(
+    model: nn.Module,
+    wandb_run,
+    regressor_module: Optional[nn.Module] = None
+):
+    grad_dict = {}
+    
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if 'model.layers.' in name:
+            grad_dict[f"GradNorm/{name}"] = param.grad.norm(p=2).item()
+
+    if regressor_module is not None:
+        for reg_name, reg_param in regressor_module.named_parameters():
+            if reg_param.grad is not None:
+                grad_dict[f"GradNorm/regressor_module/{reg_name}"] = reg_param.grad.norm(p=2).item()
+
+    wandb_run.log(grad_dict, commit=False)
+
 def set_tokenizer_params(tokenizer):
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
@@ -77,103 +99,66 @@ def profile(cfg, local_rank=None):
         yield None
 
 
-# class MultiValueClassifier(nn.Module):
-#     """
-#     This module performs multi-value classification:
-#     - We have 60 discrete values (60 for BFI-2 classification)
-#     - Each value can take 5 possible classes
-#     - We flatten them into a single linear projection that outputs 60 * 5 = 300 logits
-#     - Then we reshape [batch_size, 60, 5] for cross-entropy
-#     """
-#     def __init__(
-#         self,
-#         hidden_dim: int,
-#         num_values: int = 60,
-#         num_classes: int = 5,
-#         layer_type: str = "linear",
-#         depth: int = 2,
-#         p_dropout: float = 0.2,
-#     ):
-#         super().__init__()
-#         if layer_type == "linear":
-#             self.linear = nn.Linear(hidden_dim, num_values * num_classes, dtype=torch.bfloat16)
-#         elif layer_type == "mlp":
-#             if depth == 2:
-#                 self.linear = nn.Sequential(
-#                     nn.Linear(hidden_dim, hidden_dim // 4, dtype=torch.bfloat16),
-#                     nn.GELU(),
-#                     nn.Dropout(p_dropout),
-#                     nn.Linear(hidden_dim // 4, num_values * num_classes, dtype=torch.bfloat16),
-#                 )
-#             elif depth == 3:
-#                 self.linear = nn.Sequential(
-#                     nn.Linear(hidden_dim, hidden_dim // 2, dtype=torch.bfloat16),
-#                     nn.GELU(),
-#                     nn.Dropout(p_dropout),
-#                     nn.Linear(hidden_dim // 2, hidden_dim // 8, dtype=torch.bfloat16),
-#                     nn.GELU(),
-#                     nn.Dropout(p_dropout),
-#                     nn.Linear(hidden_dim // 8, num_values * num_classes, dtype=torch.bfloat16),
-#                 )
-#             else:
-#                 raise ValueError(f"Invalid depth {depth} for MultiValueClassifier")
-#         else:
-#             raise ValueError(f"Invalid type {type} for MultiValueClassifier")
-#         self.layer_type = layer_type
-#         self.depth = depth
-#         self.p_dropout = p_dropout
-#         self.num_values = num_values
-#         self.num_classes = num_classes
-
-#     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-#         logits = self.linear(hidden_state)
-#         logits = logits.view(-1, self.num_values, self.num_classes)
-#         return logits
-
 class MultiValueClassifier(nn.Module):
     """
-    This module performs multi-value classification:
-    - We have 60 discrete values (60 for BFI-2 classification)
-    - Each value can take 5 possible classes
-    - We flatten them into a single linear projection that outputs 60 * 5 = 300 logits
-    - Then we reshape [batch_size, 60, 5]
+    This module performs multi-value classification or regression:
+    - num_values: 1 if a single value regression, 5 if predicting Likert classification
+    - num_classes: 5 if predicting Big-Five score, 60 if predicting individual BFI-2 response
+    - We flatten them into a 1-dimensional vector of num_values * num_classes
+    - Then we reshape [batch_size, num_values, num_classes]
     """
     def __init__(
         self, hidden_dim: int, num_values: int, num_classes: int,
-        layer_type: str, depth: int, p_dropout: float, dtype: torch.dtype,
+        layer_type: str, depth: int, p_dropout: float,
+        dtype: torch.dtype,
+        hidden_dim_factor: Optional[List[int]] = None,
     ):
         super().__init__()
         if layer_type == "linear":
             self.linear = nn.Linear(hidden_dim, num_values * num_classes, dtype=dtype)
+
         elif layer_type == "mlp":
-            if depth == 2:
-                self.linear = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim // 4, dtype=dtype), nn.GELU(), nn.Dropout(p_dropout),
-                    nn.Linear(hidden_dim // 4, num_values * num_classes, dtype=dtype),
+            if hidden_dim_factor is None:
+                if depth == 2:
+                    hidden_dim_factor = [1, 4]
+                elif depth == 3:
+                    hidden_dim_factor = [1, 2, 8]
+                elif depth == 4:
+                    hidden_dim_factor = [1, 2, 4, 16]
+                else:
+                    raise NotImplementedError(f"Invalid depth {depth}")
+            assert len(hidden_dim_factor) == depth, f"Invalid hidden dimensions {hidden_dim_factor} for depth {depth}."
+
+            layers = []
+            for i in range(depth - 1):
+                layers.append(
+                    nn.Linear(
+                        hidden_dim // hidden_dim_factor[i],
+                        hidden_dim // hidden_dim_factor[i+1],
+                        dtype=dtype
+                    )
                 )
-            elif depth == 3:
-                self.linear = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim // 2, dtype=dtype), nn.GELU(), nn.Dropout(p_dropout),
-                    nn.Linear(hidden_dim // 2, hidden_dim // 8, dtype=dtype), nn.GELU(), nn.Dropout(p_dropout),
-                    nn.Linear(hidden_dim // 8, num_values * num_classes, dtype=dtype),
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(p_dropout))
+            layers.append(
+                nn.Linear(
+                    hidden_dim // hidden_dim_factor[-1],
+                    num_values * num_classes,
+                    dtype=dtype
                 )
-            elif depth == 4:
-                self.linear = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim // 2, dtype=dtype), nn.GELU(), nn.Dropout(p_dropout),
-                    nn.Linear(hidden_dim // 2, hidden_dim // 4, dtype=dtype), nn.GELU(), nn.Dropout(p_dropout),
-                    nn.Linear(hidden_dim // 4, hidden_dim // 16, dtype=dtype), nn.GELU(), nn.Dropout(p_dropout),
-                    nn.Linear(hidden_dim // 16, num_values * num_classes, dtype=dtype),
-                )
-            else:
-                raise ValueError(f"Invalid depth {depth} for MultiValueClassifier")
+            )
+            self.linear = nn.Sequential(*layers)
+
         else:
             raise ValueError(f"Invalid type {layer_type} for MultiValueClassifier")
+
         self.layer_type = layer_type
         self.depth = depth
         self.p_dropout = p_dropout
         self.num_values = num_values
         self.num_classes = num_classes
         self.dtype = dtype
+        self.hidden_dim_factor = hidden_dim_factor
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         logits = self.linear(hidden_state)
@@ -181,62 +166,18 @@ class MultiValueClassifier(nn.Module):
         return logits
 
 
-def load_TDA(
-    tda_path: Union[str, Path],
-    to_list: bool = True,
-    seperate_tone: bool = False,
-) -> Union[List[str], Dict[str, list[str]], Dict[str, Dict[str, List[str]]]]:
-    """
-    Loading the TDA json file with one the the three options.
-    1) default: put all adjectives to a single list.
-    2) to_list = False: return a dictionary, but combine positive / negative adjectives.
-    3) to_list = False, seperate_tone = True: return a dictionary in original form with seperate tone.
-    """
-    try:
-        tda_json = json.load(open(tda_path, "r"))
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"TDA file not found: {tda_path}") from exc
-    # return TDA to a single list of all adjectives.
-    # original .json file seperately stores positive and negative adjectives.
-    if to_list:
-        return [
-            adj
-            for _, wordlist in tda_json.items()
-            for tone in ['positive', 'negative']
-            for adj in wordlist[tone]
-        ]
-    # return a dictionary, but combine positive / negative adjectives.
-    if not seperate_tone:
-        return {
-            factor: wordlist['positive'] + wordlist['negative']
-            for factor, wordlist in tda_json.items()
-        }
-    # return a dictionary in original format
-    return tda_json
-
-PARENT_DIR = Path(__file__).resolve().parent.parent
-tda_dict = load_TDA(
-    tda_path = os.path.join(PARENT_DIR, "my_datasets/bfi2_60_description.json"),
-    to_list = False,
-    seperate_tone = True,
-)
-bfi_to_qid_map = json.load(open(os.path.join(PARENT_DIR, "my_datasets/bfi2_description_to_qid.json"), "r"))
-traits = ['SURGENCY', 'AGREEABLENESS', 'CONSCIENTIOUSNESS', 'EMOTIONAL_STABILITY', 'INTELLECT']
-
-def convert_bfi2_to_bfi(person_score):
-    bfi_score = {}
-    for trait in tda_dict.keys():
-        bfi_score[trait] = []
-        for tone in ['positive', 'negative']:
-            for adj in tda_dict[trait][tone]:
-                qid = bfi_to_qid_map[adj.strip()]
-                score = person_score[qid-1]
-                score = score if tone == 'positive' else -score
-                bfi_score[trait].append(score)
-    return {k: np.mean(v) for k, v in bfi_score.items()}
-
-
-def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None, regressor_module=None):
+def train(
+    model,
+    train_dataloader, eval_dataloader,
+    tokenizer,
+    optimizer, lr_scheduler, gradient_accumulation_steps,
+    train_config, fsdp_config=None,
+    local_rank=None, rank=None,
+    wandb_run=None,
+    regressor_module=None,
+    optimizer_regressor_module = None,
+    scheduler_regressor_module = None,
+):
     """
     Trains the model on the given dataloader
 
@@ -327,21 +268,32 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                                 output_hidden_states=True,
                                 return_dict=True
                             )
-                            last_hidden = outputs.hidden_states[-1]
-                            last_token_repr = last_hidden[:, -1 if train_config.use_eos else -2, :] # batch_size x hidden_dim
-                            # logits = regressor_module(last_token_repr).squeeze(-1)
-                            logits = regressor_module(last_token_repr).squeeze(1)
-                            bigfive_scores = batch['bigfive_scores'].to(torch.bfloat16)
-                            if train_config.trait is not 'all':
-                                bigfive_scores = bigfive_scores[:,
-                                    0 if train_config.trait == 'SURGENCY'
-                                    else 1 if train_config.trait == 'AGREEABLENESS'
-                                    else 2 if train_config.trait == 'CONSCIENTIOUSNESS'
-                                    else 3 if train_config.trait == 'EMOTIONAL_STABILITY'
-                                    else 4
-                                ]
-                                logits = logits.squeeze(-1)
-                            loss = F.mse_loss(logits, bigfive_scores)
+                            last_hidden = outputs.hidden_states[train_config.hidden_layer_index]
+                            last_token_repr = last_hidden[:, -1 if train_config.use_eos else -2, :]
+                            logits = regressor_module(last_token_repr)
+
+                            if train_config.training_regression_objective == "regression":
+                                logits = logits.squeeze(1)
+                                target_scores = (
+                                    batch['bigfive_scores'].to(torch.bfloat16)
+                                    if train_config.training_regression_target == "bigfive"
+                                    else batch['bfi2_labels'].to(torch.bfloat16)
+                                )
+                                loss = F.mse_loss(logits, target_scores)
+
+                            elif train_config.training_regression_objective == "classification":
+                                raise NotImplementedError("Classification objective is not implemented yet")
+                                
+                                # NOT USING PER-TRAIT TRAINING; commneted out
+                                # if train_config.trait is not 'all':
+                                #     bigfive_scores = bigfive_scores[:,
+                                #         0 if train_config.trait == 'SURGENCY'
+                                #         else 1 if train_config.trait == 'AGREEABLENESS'
+                                #         else 2 if train_config.trait == 'CONSCIENTIOUSNESS'
+                                #         else 3 if train_config.trait == 'EMOTIONAL_STABILITY'
+                                #         else 4
+                                #     ]
+                                #     logits = logits.squeeze(-1)
 
                         else:
                             if not train_config.use_weighting:
@@ -381,6 +333,8 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                                     model.clip_grad_norm_(train_config.gradient_clipping_threshold)
                                 else:
                                     torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.gradient_clipping_threshold)
+                            if wandb_run and (not train_config.enable_fsdp or rank==0):
+                                log_gradient_norms(model, wandb_run, regressor_module)                            
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad()
@@ -394,8 +348,16 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                                     model.clip_grad_norm_(train_config.gradient_clipping_threshold)
                                 else:
                                     torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.gradient_clipping_threshold)
+                            if wandb_run and (not train_config.enable_fsdp or rank==0):
+                                log_gradient_norms(model, wandb_run, regressor_module)
                             optimizer.step()
                             optimizer.zero_grad()
+                            if optimizer_regressor_module is not None:
+                                optimizer_regressor_module.step()
+                                optimizer_regressor_module.zero_grad()
+                            lr_scheduler.step()
+                            if scheduler_regressor_module is not None:
+                                scheduler_regressor_module.step()
                             pbar.update(1)
                     if train_config.use_profiler or train_config.flop_counter:
                         profile_context.step()
@@ -407,6 +369,11 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                                 'train/epoch': epoch + 1,
                                 'train/step': epoch * len(train_dataloader) + step,
                                 'train/loss': loss.detach().float(),
+                                'train/lr': optimizer.param_groups[0]['lr'],
+                                'train/regressor_lr': (
+                                    0 if optimizer_regressor_module is None
+                                    else optimizer_regressor_module.param_groups[0]['lr']
+                                ),
                             })
 
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
@@ -433,11 +400,11 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
         if not train_config.enable_fsdp or rank==0:
             memtrace.print_stats()
 
-        # Update the learning rate as needed
-        lr_scheduler.step()
         should_save_model = train_config.save_model
         if train_config.run_validation:
-            eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run, regressor_module)
+            eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(
+                model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run, regressor_module
+            )
             if train_config.save_metrics:
                 val_step_loss.extend(temp_val_loss)
                 val_step_perplexity.extend(temp_step_perplexity)
@@ -589,7 +556,7 @@ def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wand
                         batch[key] = batch[key].to('cuda:0')
             # Ensure no gradients are computed for this scope to save memory
             with torch.no_grad():
-                # Forward pass and compute loss
+
                 if train_config.training_regression:
                     outputs = model(
                         input_ids=batch['input_ids'],
@@ -597,30 +564,27 @@ def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wand
                         output_hidden_states=True,
                         return_dict=True
                     )
-                    last_hidden = outputs.hidden_states[-1]
-                    last_token_repr = last_hidden[:, -1 if train_config.use_eos else -2, :] # batch_size x hidden_dim
-                     # logits = regressor_module(last_token_repr).squeeze(-1)
-                    logits = regressor_module(last_token_repr).squeeze(1)
-                    bigfive_scores = batch['bigfive_scores'].to(torch.bfloat16)
-                    if train_config.trait is not 'all':
-                        bigfive_scores = bigfive_scores[:,
-                            0 if train_config.trait == 'SURGENCY'
-                            else 1 if train_config.trait == 'AGREEABLENESS'
-                            else 2 if train_config.trait == 'CONSCIENTIOUSNESS'
-                            else 3 if train_config.trait == 'EMOTIONAL_STABILITY'
-                            else 4
-                        ]
-                        logits = logits.squeeze(-1)
-                    loss = F.mse_loss(logits, bigfive_scores) * bigfive_scores.shape[0] / train_config.val_batch_size
+                    last_hidden = outputs.hidden_states[train_config.hidden_layer_index]
+                    last_token_repr = last_hidden[:, -1 if train_config.use_eos else -2, :]
+                    logits = regressor_module(last_token_repr)
 
-                    # logits = regressor_module(last_token_repr)
-                    # bfi2_labels = (2 + 2.0 * batch['bfi2_labels']).long()
-                    # loss = F.cross_entropy(logits.view(-1, regressor_module.num_classes), bfi2_labels.view(-1))
-
+                    if train_config.training_regression_objective == "regression":
+                        logits = logits.squeeze(1)
+                        target_scores = (
+                            batch['bigfive_scores'].to(torch.bfloat16)
+                            if train_config.training_regression_target == "bigfive"
+                            else batch['bfi2_labels'].to(torch.bfloat16)
+                        )
+                        loss = F.mse_loss(logits, target_scores) * target_scores.shape[0] / train_config.val_batch_size
+                    elif train_config.training_regression_objective == "classification":
+                        raise NotImplementedError("Classification objective is not implemented yet")
+                        
                 else:
+                    
                     if not train_config.use_weighting:
                         outputs = model(**batch)
                         loss = outputs.loss
+                    
                     else:
                         outputs = model(
                             input_ids=batch['input_ids'],

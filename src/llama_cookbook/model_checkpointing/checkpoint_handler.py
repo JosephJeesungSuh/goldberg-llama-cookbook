@@ -284,7 +284,7 @@ def save_regressor_checkpoint(regressor_module, model_path):
     """save regressor module"""
 
     state_dict = regressor_module.state_dict()
-    torch.save(state_dict, os.path.join(model_path, "classification_checkpoint.pth"))    
+    torch.save(state_dict, os.path.join(model_path, "regressor_checkpoint.pth"))    
 
 
 def save_model_checkpoint(model, output_dir):
