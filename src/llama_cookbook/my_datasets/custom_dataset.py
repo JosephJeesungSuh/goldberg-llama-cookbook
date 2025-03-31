@@ -15,7 +15,7 @@ def load_module_from_py_file(py_file: str) -> object:
     return module
 
 
-def get_custom_dataset(dataset_config, tokenizer, split: str, trait: str, tone: str, use_negative_essay: bool):
+def get_custom_dataset(dataset_config, tokenizer, split: str, train_config):
     if ":" in dataset_config.file:
         module_path, func_name = dataset_config.file.split(":")
     else:
@@ -30,7 +30,7 @@ def get_custom_dataset(dataset_config, tokenizer, split: str, trait: str, tone: 
 
     module = load_module_from_py_file(module_path.as_posix())
     try:
-        return getattr(module, func_name)(dataset_config, tokenizer, split, trait, tone, use_negative_essay)
+        return getattr(module, func_name)(dataset_config, tokenizer, split, train_config)
     except AttributeError as e:
         print(f"It seems like the given method name ({func_name}) is not present in the dataset .py file ({module_path.as_posix()}).")
         raise e

@@ -1,7 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+
+import ast
 import dataclasses
+from datetime import datetime
 import os
 import random
 from collections import Counter
@@ -103,11 +106,61 @@ def lr_lambda(current_step, warmup_steps, total_steps):
     progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
     return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(progress) * 3.14159265358979323846)))
 
+def output_dir_formatter(train_config, **kwargs):
+    """
+    Format the output directory based on the training configuration.
+    Args:
+        base_dir: base directory for saving the model
+        train_config: training configuration object
+    """
+    base_dir = train_config.output_dir
+    if base_dir.endswith("/"):
+        base_dir = base_dir[:-1]        
+    base_dir += f"/data_source_{train_config.training_data_source}"
+
+    if train_config.training_regression:
+        base_dir += "/regression"
+        base_dir += f"/use_negative_{train_config.use_negative_essay}_add_stimulus_{train_config.add_stimulus}_use_eos_{train_config.use_eos}_hidden_layer_idx_{train_config.hidden_layer_index}"
+        base_dir += f"/{train_config.model_nickname}"
+        base_dir += f"/objective_{train_config.training_regression_objective}"
+        base_dir += f"/target_value_{train_config.training_regression_target}"
+        base_dir += f"/train_regressor_head_{train_config.training_regressor_head}"
+
+        if train_config.training_regressor_head is False and train_config.regressor_module_path is None:
+            raise ValueError("Please provide a regressor module path if training_regressor_head is False.")
+        renamed_regressor_module_path = train_config.regressor_module_path.replace("/", "--") if train_config.regressor_module_path is not None else "None"
+        base_dir += f"/start_checkpoint_{renamed_regressor_module_path}"
+
+        if train_config.training_regressor_head:
+            base_dir += f"/regressor_layer_type_{train_config.regressor_layer_type}"
+            if train_config.regressor_layer_type == "mlp":
+                base_dir += f"/regressor_layer_depth_{train_config.regressor_layer_depth}"
+                base_dir += f"/regressor_hidden_dim_factor_{train_config.regressor_hidden_dim_factor}"
+                base_dir += f"/regressor_lr_{train_config.regressor_lr}_regressor_weight_decay_{train_config.regressor_weight_decay}_regressor_p_dropout_{train_config.regressor_p_dropout}_regressor_l1_lambda_{train_config.regressor_l1_lambda}"
+            else:
+                raise NotImplementedError("Only testing MLP regressor head")
+
+        base_dir += f"/lr_{train_config.lr}_bs_{train_config.batch_size_training*int(os.environ.get('WORLD_SIZE', 1))}_wd_{train_config.weight_decay}"
+        base_dir += f"/lora_r_{kwargs.get('lora_config.r', 8)}_lora_alpha_{kwargs.get('lora_config.lora_alpha', 32)}_lora_dropout_{kwargs.get('lora_config.lora_dropout', 0.05)}"
+
+    else:
+        base_dir += "/sft"
+        base_dir += f"/use_negative_{train_config.use_negative_essay}"
+        base_dir += f"/{train_config.model_nickname}"      
+        base_dir += f"/{train_config.trait}_{train_config.tone}"
+        base_dir += f"/use_weighting_{train_config.use_weighting}_alpha_{train_config.weighting_alpha}"
+        base_dir += f"/lr_{train_config.lr}_bs_{train_config.batch_size_training*int(os.environ.get('WORLD_SIZE', 1))}_wd_{train_config.weight_decay}"
+        base_dir += f"/lora_r_{kwargs.get('lora_config.r', 8)}_lora_alpha_{kwargs.get('lora_config.lora_alpha', 32)}_lora_dropout_{kwargs.get('lora_config.lora_dropout', 0.05)}"
+    return base_dir
+
 
 def main(**kwargs):
+    print(f"--> main.py print all arguments: {kwargs}")
     # Update the configuration for the training and sharding process
     train_config, fsdp_config = TRAIN_CONFIG(), FSDP_CONFIG()
+    # lr_${LR}_bs_${BATCH_SIZE_TRAINING}/${REGRESSOR_LAYER_TYPE}_${REGRESSOR_LAYER_DEPTH}_${REGRESSOR_P_DROPOUT}_${WEIGHT_DECAY}/
     update_config((train_config, fsdp_config), **kwargs)
+    print(f"--> main.py print all train configurations: {train_config}")
     # Set the seeds for reproducibility
     if is_xpu_available():
         torch.xpu.manual_seed(train_config.seed)
@@ -122,6 +175,9 @@ def main(**kwargs):
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
 
+    train_config.output_dir = output_dir_formatter(train_config, **kwargs)
+    print(f"--> Output Directory: {train_config.output_dir}")
+
     if torch.distributed.is_initialized():
         if is_xpu_available():
             torch.xpu.set_device(local_rank)
@@ -130,8 +186,25 @@ def main(**kwargs):
         clear_gpu_cache(local_rank)
         setup_environ_flags(rank)
 
-    wandb_run = None
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            current_time = datetime.now()
+            formatted_time = current_time.strftime("%Y%m%d_%H%M%S")
+            formatted_time_tensor = torch.tensor([ord(c) for c in formatted_time], dtype=torch.int32, device="cuda")
+        else:
+            formatted_time_tensor = torch.empty(15, dtype=torch.int32, device="cuda")
+        # synchronize the formatted time tensor across all ranks to ensure the output directory is consistent
+        torch.distributed.barrier()
+        torch.distributed.broadcast(formatted_time_tensor, src=0)
+        torch.distributed.barrier()        
+        formatted_time = ''.join([chr(c) for c in formatted_time_tensor.cpu().tolist() if c != 0])
+    else:
+        current_time = datetime.now()
+        formatted_time = current_time.strftime("%Y%m%d_%H%M%S")    
+    train_config.output_dir += "-" + formatted_time
+    print(f"--> Output Directory (Rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 'N/A'}): {train_config.output_dir}")
 
+    wandb_run = None
     if train_config.use_wandb:
         if not train_config.enable_fsdp or rank == 0:
             wandb_run = setup_wandb(train_config, fsdp_config, **kwargs)
@@ -234,11 +307,15 @@ def main(**kwargs):
             f"Model type {config.model_type} is not supported. Please use llama or mllama model."
         )
     # Load the tokenizer and add special tokens
-    tokenizer = AutoTokenizer.from_pretrained(
-        train_config.model_name
-        if train_config.tokenizer_name is None
-        else train_config.tokenizer_name
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            train_config.model_name if train_config.tokenizer_name is None else train_config.tokenizer_name,
+            add_prefix_space=False,
+        )
+    except:
+        tokenizer = AutoTokenizer.from_pretrained(
+            train_config.model_name if train_config.tokenizer_name is None else train_config.tokenizer_name,
+        )
     if not tokenizer.pad_token_id:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -326,7 +403,27 @@ def main(**kwargs):
 
         regressor_module = None
         if train_config.training_regression:
-            regressor_module = MultiValueClassifier(hidden_dim = model.lm_head.in_features)
+
+            assert train_config.training_regression_objective in ["regression", "classification"]
+            assert train_config.training_regression_target in ["bigfive", "bfi2"]
+            assert train_config.regressor_layer_type in ["mlp", "linear"]
+            regressor_hidden_dim_factor = train_config.regressor_hidden_dim_factor
+            if not isinstance(regressor_hidden_dim_factor, list):
+                regressor_hidden_dim_factor = ast.literal_eval(regressor_hidden_dim_factor)
+            assert len(regressor_hidden_dim_factor) == train_config.regressor_layer_depth
+
+            regressor_module = MultiValueClassifier(
+                hidden_dim = model.lm_head.in_features,
+                num_values = 1 if train_config.training_regression_objective == "regression" else 5,
+                num_classes = 5 if train_config.training_regression_target == "bigfive" else 60,
+                layer_type = train_config.regressor_layer_type,
+                depth = train_config.regressor_layer_depth,
+                p_dropout = train_config.regressor_p_dropout,
+                dtype = torch.bfloat16,
+                hidden_dim_factor = regressor_hidden_dim_factor,
+            )
+            if train_config.regressor_module_path is not None:
+                regressor_module.load_state_dict(torch.load(train_config.regressor_module_path))
             regressor_module = regressor_module.to(local_rank)
 
         if train_config.freeze_LLM_only:
@@ -380,9 +477,7 @@ def main(**kwargs):
         dataset_processer,
         dataset_config,
         split="train",
-        trait=train_config.trait,
-        tone=train_config.tone,
-        use_negative_essay=train_config.use_negative_essay,
+        train_config=train_config,
     )
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
@@ -391,9 +486,7 @@ def main(**kwargs):
         dataset_processer,
         dataset_config,
         split="test",
-        trait=train_config.trait,
-        tone=train_config.tone,
-        use_negative_essay=train_config.use_negative_essay,
+        train_config=train_config,
     )
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Validation Set Length = {len(dataset_val)}")
@@ -409,7 +502,6 @@ def main(**kwargs):
     train_dl_kwargs = get_dataloader_kwargs(
         train_config, dataset_train, dataset_processer, "train"
     )
-    print("length of dataset_train", len(dataset_train))
     custom_data_collator = get_custom_data_collator(dataset_processer, dataset_config)
     if custom_data_collator:
         print("custom_data_collator is used")
@@ -456,19 +548,36 @@ def main(**kwargs):
     # Initialize the optimizer and learning rate scheduler
     if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
         optimizer = AnyPrecisionAdamW(
-            list(model.parameters()) + list(regressor_module.parameters()) if train_config.training_regression else [],
+            model.parameters(),
             lr=train_config.lr,
             momentum_dtype=torch.bfloat16,
             variance_dtype=torch.bfloat16,
             use_kahan_summation=False,
             weight_decay=train_config.weight_decay,
         )
+        optimizer_regressor_module = None
+        if train_config.training_regression and train_config.training_regressor_head:
+            optimizer_regressor_module = AnyPrecisionAdamW(
+                regressor_module.parameters(),
+                lr=train_config.regressor_lr,
+                momentum_dtype=torch.bfloat16,
+                variance_dtype=torch.bfloat16,
+                use_kahan_summation=False,
+                weight_decay=train_config.regressor_weight_decay,
+            )
     else:
         optimizer = optim.AdamW(
-            list(model.parameters()) + (list(regressor_module.parameters()) if train_config.training_regression else []),
+            model.parameters(),
             lr=train_config.lr,
             weight_decay=train_config.weight_decay,
         )
+        optimizer_regressor_module = None
+        if train_config.training_regression and train_config.training_regressor_head:
+                optimizer_regressor_module = optim.AdamW(
+                regressor_module.parameters(),
+                lr=train_config.regressor_lr,
+                weight_decay=train_config.regressor_weight_decay,
+            )
     # scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
     if train_config.which_scheduler == "cosine":
         total_steps = int(
@@ -483,6 +592,16 @@ def main(**kwargs):
                 total_steps = total_steps,
             )
         )
+        scheduler_regressor_module = None
+        if optimizer_regressor_module is not None:
+            scheduler_regressor_module = LambdaLR(
+                optimizer_regressor_module,
+                lr_lambda=lambda step: lr_lambda(
+                    current_step = step,
+                    warmup_steps = int(train_config.warmup_ratio * float(total_steps)),
+                    total_steps = total_steps,
+                )
+            )
         print(f"--> Using Cosine Scheduler with total_steps = {total_steps},"
                " warmup_steps = {int(train_config.warmup_ratio * total_steps)}")
     elif train_config.which_scheduler == 'step':
@@ -494,6 +613,16 @@ def main(**kwargs):
                 * float(train_config.gradient_accumulation_steps)
             ),
         )
+        scheduler_regressor_module = None
+        if optimizer_regressor_module is not None:
+            scheduler_regressor_module = StepLR(
+                optimizer_regressor_module,
+                step_size=1,
+                gamma=train_config.gamma ** (
+                    1.0 / float(len(train_dataloader))
+                    * float(train_config.gradient_accumulation_steps)
+                ),
+            )
         print(f"--> Using Step Scheduler with gamma = {scheduler.gamma}")
 
     results = train(
@@ -510,6 +639,8 @@ def main(**kwargs):
         rank if train_config.enable_fsdp else None,
         wandb_run,
         regressor_module,
+        optimizer_regressor_module,
+        scheduler_regressor_module,
     )
     if not train_config.enable_fsdp or rank == 0:
         [print(f"Key: {k}, Value: {v}") for k, v in results.items()]

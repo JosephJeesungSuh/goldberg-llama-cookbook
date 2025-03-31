@@ -9,25 +9,22 @@ from llama_cookbook.utils.config_utils import get_dataloader_kwargs
 
 
 def get_preprocessed_dataset(
-    tokenizer, dataset_config, split: str = "train",
-    trait: str = None, tone: str = None, use_negative_essay: bool = False
+    tokenizer, dataset_config, split, train_config,
 ) -> torch.utils.data.Dataset:
     if not dataset_config.dataset in DATASET_PREPROC:
         raise NotImplementedError(f"{dataset_config.dataset} is not (yet) implemented")
 
     def get_split():
         return (
-            dataset_config.train_split # "src/llama_cookbook/datasets/personality_essay_train.json"
-            if split == "train"
-            else dataset_config.test_split # "src/llama_cookbook/datasets/personality_essay_validation.json"
+            dataset_config.train_split if split == "train"
+            else dataset_config.test_split
         )
+
     return DATASET_PREPROC[dataset_config.dataset]( # get_custom_dataset
         dataset_config,
         tokenizer,
-        get_split(),
-        trait=trait,
-        tone=tone,
-        use_negative_essay=use_negative_essay,
+        get_split().format(data_source=train_config.training_data_source),
+        train_config,
     )
 
 def get_custom_data_collator(

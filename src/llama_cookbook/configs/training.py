@@ -24,7 +24,6 @@ class train_config:
     num_workers_dataloader: int=4
     lr: float=1e-4
     weight_decay: float=0.0
-    gamma: float= 0.85 # multiplicatively decay the learning rate by gamma after each epoch
     seed: int=42
     use_fp16: bool=False  # load model paramater in torch.float16 dtype (not recommended)
     mixed_precision: bool=True
@@ -50,14 +49,34 @@ class train_config:
     flop_counter_start: int = 3 # The step to start profiling, default is 3, which means after 3 steps of warmup stage, the profiler will start to count flops.
     use_profiler: bool = False # Enable pytorch profiler, can not be used with flop counter at the same time.
     profiler_dir: str = "PATH/to/save/profiler/results" # will be used if using profiler
-    
+
+    training_data_source: str = "human"
     which_scheduler: str = 'cosine'  # cosine or step
     warmup_ratio: float = 0.1
+    gamma: float= 0.85 # multiplicatively decay the learning rate by gamma after each epoch
 
+    # arguments for SFT finetuning (difference-of-logprob method)
     trait: str = 'SURGENCY'
     tone: str = 'positive'
     use_weighting: bool = False
     weighting_alpha: float = 1.0
 
-    training_regression: bool = False # if training_regression = True, regressor head training.
-    use_negative_essay: bool = False
+    # arguments for regressor head training
+    training_regression: bool = False
+    training_regression_objective: str = "regression"  # regression or classification
+    training_regression_target: str = "bigfive"  # bigfive or bfi2
+    training_regressor_head: bool = False # if False, only training the LoRA module
+    regressor_module_path: str = None # pre-trained regressor module checkpoint path
+    
+    regressor_lr: float = 1e-4
+    regressor_weight_decay: float = 0.0
+    regressor_p_dropout: float = 0.2 # dropout rate 
+    regressor_l1_lambda: float = 0.0 # L1 regularization 
+    regressor_layer_type: str = "mlp"
+    regressor_layer_depth: int = 2 # depth of the regressor head
+    regressor_hidden_dim_factor: str = "[1,4]" # hidden dimension factor for the regressor head
+    
+    hidden_layer_index: int = -1
+    use_negative_essay: bool = True 
+    add_stimulus: bool = True
+    use_eos: bool = False
